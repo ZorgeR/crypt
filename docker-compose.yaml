@@ -4,11 +4,16 @@ services:
     # Bound memory so a flood of secrets can't exhaust the host. Secrets are
     # TTL'd and must never be silently dropped, so use noeviction: once the cap
     # is hit, new writes are rejected (surfacing pressure) rather than evicting
-    # live secrets. Tune REDIS_MAXMEMORY to the host.
+    # live secrets.
+    #
+    # Only inline secrets live here — a streamed payload costs ~0.4 KB in Redis
+    # regardless of its size. Give the container roughly double this value in
+    # real memory: RDB snapshots fork, and copy-on-write can approach 2x during
+    # the write.
     command:
       - redis-server
       - --maxmemory
-      - ${REDIS_MAXMEMORY:-256mb}
+      - ${REDIS_MAXMEMORY:-4gb}
       - --maxmemory-policy
       - noeviction
       - --save
@@ -25,6 +30,11 @@ services:
       dockerfile: Dockerfile.server
     environment:
       - REDIS_URL=redis://redis:6379
+      # Without these the server falls back to development mode and the
+      # well-known key 'foobar', which encrypts webhook URLs and IP allow-lists
+      # at rest. Compose fails fast rather than starting an insecure instance.
+      - NODE_ENV=${NODE_ENV:-production}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY} # ! required - copy .env.example to .env and run openssl rand -base64 32
       - PORT=${SERVER_PORT:-4321}
     ports:
       - '${SERVER_PORT:-4321}:${SERVER_PORT:-4321}'
@@ -42,6 +52,7 @@ services:
         # compiled into the static bundle, so `--build` is required to change them.
         - VITE_REQUIRE_PASSWORD=${REQUIRE_PASSWORD:-false}
         - VITE_PASSWORD_MIN_LENGTH=${PASSWORD_MIN_LENGTH:-5}
+        - VITE_APP_NAME=${APP_NAME:-CyberForce Crypt}
     environment:
       - API_URL=${API_URL:-http://localhost:${SERVER_PORT:-4321}}
     ports:

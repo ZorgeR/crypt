@@ -97,11 +97,12 @@ export const es: TranslationKeys = {
       content: {
         label: 'Contenido secreto',
         placeholder: 'Ingresa tu contenido secreto aquí...',
-        fileHint: 'agrega un archivo arrastrándolo o haciendo clic aquí (máx 1 MB)',
+        fileHint: 'añade un archivo arrastrándolo o haciendo clic aquí (máx. {{max}})',
         fileSelected: 'Archivo seleccionado: {{name}} ({{size}} KB)',
         dropFile: 'Suelta el archivo aquí',
         invalidFileType: 'Tipo de archivo no válido',
       },
+      uploadProgress: 'Progreso de subida',
       password: {
         label: 'Contraseña',
         placeholder: 'Opcional (pero recomendado)',
@@ -205,6 +206,8 @@ export const es: TranslationKeys = {
       webhookConfigInvalid:
         'La configuración del webhook no es válida: se requiere al menos un tipo de evento de webhook',
       fileSizeExceeded: 'El archivo es demasiado grande. El tamaño máximo es {{max}}.',
+      payloadTooLarge:
+        'Este secreto es demasiado grande para este servidor. Prueba con un archivo más pequeño.',
       fileReadError: 'Error al leer el archivo',
       fileReadAborted: 'La lectura del archivo fue interrumpida',
     },
@@ -268,6 +271,12 @@ export const es: TranslationKeys = {
     content: {
       fileShared: 'Se ha compartido un archivo contigo',
       downloadFile: 'Descargar Archivo',
+      downloadComplete: 'Descarga completada',
+      stillAvailable:
+        'Este secreto sigue disponible hasta que caduque o alcance su límite de lecturas.',
+      streamedDescription:
+        'Este archivo se descifra en tu navegador y se escribe directamente en el disco. Elige dónde guardarlo.',
+      downloadProgress: 'Progreso de descarga',
       hideContent: 'Ocultar contenido',
       showContent: 'Mostrar contenido',
       copyToClipboard: 'Copiar al portapapeles',

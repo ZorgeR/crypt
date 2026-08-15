@@ -94,11 +94,12 @@ export const zh: TranslationKeys = {
       content: {
         label: '密文内容',
         placeholder: '在此输入您的密文内容...',
-        fileHint: '拖放或点击此处添加文件（最大 1 MB）',
+        fileHint: '拖放或点击此处添加文件（最大 {{max}}）',
         fileSelected: '已选择文件：{{name}}（{{size}} KB）',
         dropFile: '拖放文件到此处',
         invalidFileType: '无效的文件类型',
       },
+      uploadProgress: '上传进度',
       password: {
         label: '密码',
         placeholder: '可选（但建议使用）',
@@ -196,6 +197,7 @@ export const zh: TranslationKeys = {
       unexpectedStatus: '意外的状态码 {{code}}',
       webhookConfigInvalid: 'Webhook配置无效 - 至少需要一个Webhook事件类型',
       fileSizeExceeded: '文件过大。最大大小为 {{max}}。',
+      payloadTooLarge: '此密钥对该服务器来说太大。请尝试较小的文件。',
       fileReadError: '读取文件失败',
       fileReadAborted: '文件读取已中止',
     },
@@ -255,6 +257,10 @@ export const zh: TranslationKeys = {
     content: {
       fileShared: '有人与您分享了一个文件',
       downloadFile: '下载文件',
+      downloadComplete: '下载完成',
+      stillAvailable: '在过期或达到读取上限之前，此密钥仍然可用。',
+      streamedDescription: '该文件在您的浏览器中解密并直接写入磁盘。请选择保存位置。',
+      downloadProgress: '下载进度',
       hideContent: '隐藏内容',
       showContent: '显示内容',
       copyToClipboard: '复制到剪贴板',

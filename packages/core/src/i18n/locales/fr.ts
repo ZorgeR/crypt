@@ -97,11 +97,12 @@ export const fr: TranslationKeys = {
       content: {
         label: 'Contenu secret',
         placeholder: 'Saisissez votre contenu secret ici...',
-        fileHint: 'ajoutez un fichier en le déposant ou en cliquant ici (max 1 Mo)',
+        fileHint: 'ajoutez un fichier par glisser-déposer ou en cliquant ici (max {{max}})',
         fileSelected: 'Fichier sélectionné : {{name}} ({{size}} Ko)',
         dropFile: 'Déposez le fichier ici',
         invalidFileType: 'Type de fichier invalide',
       },
+      uploadProgress: 'Progression de l’envoi',
       password: {
         label: 'Mot de passe',
         placeholder: 'Optionnel (mais recommandé)',
@@ -206,6 +207,8 @@ export const fr: TranslationKeys = {
       webhookConfigInvalid:
         "La configuration du webhook est invalide - au moins un type d'événement webhook est requis",
       fileSizeExceeded: 'Le fichier est trop volumineux. La taille maximale est {{max}}.',
+      payloadTooLarge:
+        'Ce secret est trop volumineux pour ce serveur. Essayez un fichier plus petit.',
       fileReadError: 'Échec de la lecture du fichier',
       fileReadAborted: 'La lecture du fichier a été interrompue',
     },
@@ -269,6 +272,11 @@ export const fr: TranslationKeys = {
     content: {
       fileShared: 'Un fichier a été partagé avec vous',
       downloadFile: 'Télécharger le Fichier',
+      downloadComplete: 'Téléchargement terminé',
+      stillAvailable: 'Ce secret reste disponible jusqu’à son expiration ou sa limite de lectures.',
+      streamedDescription:
+        'Ce fichier est déchiffré dans votre navigateur et écrit directement sur le disque. Choisissez où l’enregistrer.',
+      downloadProgress: 'Progression du téléchargement',
       hideContent: 'Masquer le contenu',
       showContent: 'Afficher le contenu',
       copyToClipboard: 'Copier dans le presse-papiers',

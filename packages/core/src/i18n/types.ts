@@ -93,6 +93,7 @@ export interface TranslationKeys {
         dropFile: string;
         invalidFileType: string;
       };
+      uploadProgress: string;
       password: {
         label: string;
         placeholder: string;
@@ -190,6 +191,7 @@ export interface TranslationKeys {
       unexpectedStatus: string;
       webhookConfigInvalid: string;
       fileSizeExceeded: string;
+      payloadTooLarge: string;
       fileReadError: string;
       fileReadAborted: string;
     };
@@ -248,6 +250,10 @@ export interface TranslationKeys {
     content: {
       fileShared: string;
       downloadFile: string;
+      downloadComplete: string;
+      stillAvailable: string;
+      streamedDescription: string;
+      downloadProgress: string;
       hideContent: string;
       showContent: string;
       copyToClipboard: string;

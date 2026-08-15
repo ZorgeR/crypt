@@ -96,11 +96,12 @@ export const de: TranslationKeys = {
       content: {
         label: 'Geheimer Inhalt',
         placeholder: 'Geben Sie hier Ihren geheimen Inhalt ein...',
-        fileHint: 'Datei per Drag & Drop hinzufügen oder hier klicken (max. 1 MB)',
+        fileHint: 'Datei per Drag-and-Drop oder Klick hinzufügen (max. {{max}})',
         fileSelected: 'Datei ausgewählt: {{name}} ({{size}} KB)',
         dropFile: 'Datei hier ablegen',
         invalidFileType: 'Ungültiger Dateityp',
       },
+      uploadProgress: 'Upload-Fortschritt',
       password: {
         label: 'Passwort',
         placeholder: 'Optional (aber empfohlen)',
@@ -204,6 +205,8 @@ export const de: TranslationKeys = {
       webhookConfigInvalid:
         'Webhook-Konfiguration ist ungültig - mindestens ein Webhook-Ereignistyp ist erforderlich',
       fileSizeExceeded: 'Datei ist zu groß. Maximale Größe ist {{max}}.',
+      payloadTooLarge:
+        'Dieses Geheimnis ist zu groß für diesen Server. Versuche eine kleinere Datei.',
       fileReadError: 'Fehler beim Lesen der Datei',
       fileReadAborted: 'Dateilesen wurde abgebrochen',
     },
@@ -269,6 +272,12 @@ export const de: TranslationKeys = {
     content: {
       fileShared: 'Eine Datei wurde mit Ihnen geteilt',
       downloadFile: 'Datei herunterladen',
+      downloadComplete: 'Download abgeschlossen',
+      stillAvailable:
+        'Dieses Geheimnis bleibt verfügbar, bis es abläuft oder sein Leselimit erreicht ist.',
+      streamedDescription:
+        'Diese Datei wird in deinem Browser entschlüsselt und direkt auf die Festplatte geschrieben. Wähle einen Speicherort.',
+      downloadProgress: 'Download-Fortschritt',
       hideContent: 'Inhalt verbergen',
       showContent: 'Inhalt anzeigen',
       copyToClipboard: 'In die Zwischenablage kopieren',

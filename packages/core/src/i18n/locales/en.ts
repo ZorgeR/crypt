@@ -96,11 +96,12 @@ export const en: TranslationKeys = {
       content: {
         label: 'Secret content',
         placeholder: 'Enter your secret content or file here...',
-        fileHint: 'add a file by drag-n-drop or clicking here (max 1 MB)',
+        fileHint: 'add a file by drag-n-drop or clicking here (max {{max}})',
         fileSelected: 'File selected: {{name}} ({{size}} KB)',
         dropFile: 'Drop file here',
         invalidFileType: 'Invalid file type',
       },
+      uploadProgress: 'Upload progress',
       password: {
         label: 'Password',
         placeholder: 'Optional (but recommended)',
@@ -202,6 +203,7 @@ export const en: TranslationKeys = {
       webhookConfigInvalid:
         'Webhook configuration is invalid - at least one webhook event type is required',
       fileSizeExceeded: 'File is too large. Maximum size is {{max}}.',
+      payloadTooLarge: 'This secret is too large for this server. Try a smaller file.',
       fileReadError: 'Failed to read file',
       fileReadAborted: 'File reading was aborted',
     },
@@ -264,6 +266,12 @@ export const en: TranslationKeys = {
     content: {
       fileShared: 'A file has been shared with you',
       downloadFile: 'Download File',
+      downloadComplete: 'Download complete',
+      stillAvailable:
+        'This secret is still available until it expires or its read limit is reached.',
+      streamedDescription:
+        'This file is decrypted in your browser and written straight to disk. Choose where to save it.',
+      downloadProgress: 'Download progress',
       hideContent: 'Hide content',
       showContent: 'Show content',
       copyToClipboard: 'Copy to clipboard',

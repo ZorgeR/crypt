@@ -1,5 +1,7 @@
 import { Buffer } from './buffer';
 import {
+  serverConfigResponseSchema,
+  type ServerConfigResponse,
   CreateVaultRequest,
   CreateVaultResponse,
   DeleteVaultRequest,
@@ -7,7 +9,13 @@ import {
 } from './api';
 import { generateRandomString } from './random';
 import { KEY_VERSION_2_PREFIX, deriveVerificationHash, parseKey } from './verification';
-import { encryptionRegistry, compressionRegistry, validateMetadata } from './encryption/registry';
+import {
+  encryptionRegistry,
+  compressionRegistry,
+  validateMetadata,
+  isStreamAlgorithm,
+} from './encryption/registry';
+import { chooseCompressionAlgorithm } from './encryption/compression';
 import { ProcessingMetadata } from './vault';
 import { gcm } from './encryption';
 import { inflate } from 'pako';
@@ -56,7 +64,7 @@ export class Client {
     }
 
     if (metadata.encryption?.algorithm) {
-      const algorithm = encryptionRegistry[metadata.encryption.algorithm];
+      const algorithm = encryptionRegistry[assertInlineAlgorithm(metadata)];
       processed = await algorithm.encrypt(processed, key);
     }
 
@@ -106,7 +114,7 @@ export class Client {
     let recovered = encoded;
 
     if (metadata.encryption?.algorithm) {
-      const algorithm = encryptionRegistry[metadata.encryption.algorithm];
+      const algorithm = encryptionRegistry[assertInlineAlgorithm(metadata)];
       recovered = await algorithm.decrypt(recovered, key);
     }
 
@@ -129,7 +137,10 @@ export class Client {
     // the user-password layer, and only when a password is actually set.
     const metadata: ProcessingMetadata = input.m ?? {
       compression: {
-        algorithm: 'zlib:pako',
+        // Chosen per payload: deflate has to beat the base64 that follows it,
+        // which incompressible content (images, archives, encrypted files)
+        // never does. See encryption/compression.ts.
+        algorithm: chooseCompressionAlgorithm(input.c),
       },
       encryption: {
         algorithm: 'ml-kem-768-2',
@@ -187,6 +198,9 @@ export class Client {
       } satisfies CreateVaultRequest),
     });
     if (!response.ok) {
+      if (response.status === 413) {
+        throw new ErrorPayloadTooLarge();
+      }
       throw new ErrorUnexpectedStatus(response.status);
     }
 
@@ -214,6 +228,9 @@ export class Client {
     }
 
     const data = await (res.json() as Promise<ReadVaultResponse>);
+    if (typeof data.c !== 'string') {
+      throw new ErrorStreamedPayload();
+    }
     let decrypted: string;
     if (!password) {
       decrypted = await this.recoverContent(data.c, rawKey, data.m);
@@ -249,6 +266,15 @@ export class Client {
     }
   }
 
+  /** Limits this deployment accepts. Falls back to the caller's default. */
+  async serverConfig(): Promise<ServerConfigResponse> {
+    const res = await fetch(`${this.apiUrl}/config`, { headers: this.getHeaders() });
+    if (!res.ok) {
+      throw new ErrorUnexpectedStatus(res.status);
+    }
+    return serverConfigResponseSchema.parse(await res.json());
+  }
+
   async exists(id: string): Promise<boolean> {
     const response = await fetch(`${this.apiUrl}/vault/${id}`, {
       method: 'HEAD',
@@ -262,6 +288,35 @@ export class Client {
     }
 
     return true;
+  }
+}
+
+/**
+ * Streamed payloads are framed and byte-oriented; they never travel through the
+ * inline string pipeline. Anything reaching these helpers with the streaming
+ * algorithm is a routing bug, so fail loudly rather than index a missing entry.
+ */
+function assertInlineAlgorithm(metadata: ProcessingMetadata) {
+  const algorithm = metadata.encryption.algorithm;
+  if (isStreamAlgorithm(algorithm)) {
+    throw new Error(
+      'streamed payloads are not handled by the inline pipeline; use encryption/stream',
+    );
+  }
+  return algorithm;
+}
+
+export class ErrorPayloadTooLarge extends Error {
+  constructor() {
+    super('secret is too large for this server');
+    this.name = 'ErrorPayloadTooLarge';
+  }
+}
+
+export class ErrorStreamedPayload extends Error {
+  constructor() {
+    super('secret is stored as a streamed payload and must be read with the streaming reader');
+    this.name = 'ErrorStreamedPayload';
   }
 }
 

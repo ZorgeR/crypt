@@ -33,6 +33,24 @@ const env = getEnv();
 
 const logLevels = ['trace', 'debug', 'info', 'warn', 'error', 'fatal'] as const;
 
+/**
+ * Booleans from the environment.
+ *
+ * `z.coerce.boolean()` is `Boolean(value)`, so every non-empty string is true —
+ * `OTEL_ENABLED=false` enables telemetry and `ALLOW_PERSISTENCE=false` allows
+ * retention. Parse the words people actually write instead.
+ */
+export const envBoolean = (defaultValue: boolean) =>
+  z.preprocess((value) => {
+    if (typeof value === 'boolean') return value;
+    if (typeof value !== 'string') return undefined;
+    const normalized = value.trim().toLowerCase();
+    if (normalized === '') return undefined;
+    if (['true', '1', 'yes', 'y', 'on'].includes(normalized)) return true;
+    if (['false', '0', 'no', 'n', 'off'].includes(normalized)) return false;
+    return undefined;
+  }, z.boolean().default(defaultValue));
+
 const configSchema = z.object({
   shutdownTimeoutMs: z.coerce
     .number()
@@ -89,8 +107,11 @@ const configSchema = z.object({
     .describe(
       'allowed CORS headers (comma-separated) https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Headers',
     ),
-  encryptionKey: z.string().describe('encryption key'),
-  otelEnabled: z.coerce.boolean().default(false).describe('enable OpenTelemetry tracing'),
+  encryptionKey: z
+    .string()
+    .min(1, 'ENCRYPTION_KEY must be set')
+    .describe('encryption key for webhook URLs and IP allow-lists at rest'),
+  otelEnabled: envBoolean(false).describe('enable OpenTelemetry tracing'),
   otelExporterOtlpEndpoint: z.string().describe('OpenTelemetry collector endpoint').optional(),
   otelExporterOtlpHeaders: z
     .record(z.string(), z.string())
@@ -126,14 +147,10 @@ const configSchema = z.object({
     .number()
     .default(5_000)
     .describe('webhook retry backoff delay in milliseconds'),
-  webhookRemoveOnComplete: z.coerce
-    .boolean()
-    .default(true)
-    .describe('remove webhook jobs from queue when complete'),
-  webhookRemoveOnFail: z.coerce
-    .boolean()
-    .default(true)
-    .describe('remove webhook jobs from queue when failed'),
+  webhookRemoveOnComplete: envBoolean(true).describe(
+    'remove webhook jobs from queue when complete',
+  ),
+  webhookRemoveOnFail: envBoolean(true).describe('remove webhook jobs from queue when failed'),
   webhookConcurrency: z.coerce.number().default(50).describe('number of concurrent webhook jobs'),
   webhookDrainDelayMs: z.coerce
     .number()
@@ -144,11 +161,55 @@ const configSchema = z.object({
     .default(100)
     .describe('maximum length of webhook events stream'),
   webhookSender: z.enum(['bullmq', 'http']).default('bullmq').describe('webhook sender type'),
-  webhookRequireHttps: z.coerce
-    .boolean()
-    .default(false)
-    .describe('require webhook target URLs to use https (SSRF hardening)'),
+  webhookRequireHttps: envBoolean(false).describe(
+    'require webhook target URLs to use https (SSRF hardening)',
+  ),
   rateLimiter: z.enum(['redis', 'memory']).default('redis').describe('rate limiter type'),
+
+  // --- streamed payloads (object storage) ---
+  blobStorageEnabled: envBoolean(false).describe(
+    'accept payloads above the inline threshold via object storage',
+  ),
+  blobStorageType: z
+    .enum(['s3', 'memory'])
+    .default('s3')
+    .describe('object storage backend; "memory" is for development and tests only'),
+  blobKeyPrefix: z.string().default('secrets').describe('object key prefix'),
+  // Off by default: burning a link deletes the object, matching the inline path
+  // and the ephemeral guarantee in SPECIFICATION.md.
+  allowPersistence: envBoolean(false).describe(
+    'allow stored objects to be retained after their link is burned',
+  ),
+  maxBlobBytes: z.coerce
+    .number()
+    .default(2 * 1024 * 1024 * 1024)
+    .describe('maximum ciphertext bytes for a single streamed payload'),
+  // Grace on top of the TTL so a slow upload cannot expire mid-transfer.
+  uploadWindowMs: z.coerce
+    .number()
+    .default(1000 * 60 * 60 * 6)
+    .describe('how long an incomplete upload may stay open, in milliseconds'),
+  maxUploadPartBytes: z.coerce
+    .number()
+    .default(16 * 1024 * 1024)
+    .describe(
+      'maximum bytes accepted in a single upload part. A part is held in memory while it is relayed, so this bounds per-request memory; keep it at or below any proxy body limit (Cloudflare: 100 MB).',
+    ),
+  uploadTokenLength: z.coerce.number().default(32).describe('upload token length'),
+  blobIdLength: z.coerce.number().default(20).describe('storage object id length'),
+  s3Bucket: z.string().optional().describe('S3 bucket name'),
+  s3Region: z.string().default('us-east-1').describe('S3 region'),
+  s3Endpoint: z.string().optional().describe('S3-compatible endpoint (MinIO, R2, …)'),
+  s3AccessKeyId: z.string().optional().describe('S3 access key id'),
+  s3SecretAccessKey: z.string().optional().describe('S3 secret access key'),
+  s3ForcePathStyle: envBoolean(true).describe('use path-style addressing; required by MinIO'),
+  // Defence in depth only — payloads are already end-to-end encrypted. Off by
+  // default because AWS S3 accepts AES256 natively while MinIO rejects any SSE
+  // unless a KMS is configured, so an unconditional default breaks self-hosting.
+  s3ServerSideEncryption: z
+    .enum(['none', 'AES256', 'aws:kms'])
+    .default('none')
+    .describe('server-side encryption for stored objects'),
 });
 
 export type Config = z.infer<typeof configSchema>;
@@ -176,7 +237,11 @@ export const config = (() => {
     vaultEntryTTLMsDefault: process.env.VAULT_ENTRY_TTL_MS_DEFAULT,
     vaultEntryIdentifierLength: process.env.VAULT_ENTRY_IDENTIFIER_LENGTH,
     vaultEntryDeleteTokenLength: process.env.VAULT_ENTRY_DELETE_TOKEN_LENGTH,
-    bodyLimit: parseBytes(process.env.BODY_LIMIT_BYTES ?? '100KB'),
+    // Sized to the 128 KiB inline threshold. Inline payloads expand ~1.8x (no
+    // password) to ~2.4x (password) through encryption and base64, so 512KB
+    // carries the largest inline secret with headroom. Anything bigger belongs
+    // on the streamed path, where it never touches Redis.
+    bodyLimit: parseBytes(process.env.BODY_LIMIT_BYTES ?? '512KB'),
     swaggerUIPath: process.env.SWAGGER_UI_PATH,
     corsOrigin: process.env.CORS_ORIGIN,
     corsMethods: process.env.CORS_METHODS,
@@ -204,5 +269,23 @@ export const config = (() => {
     webhookSender: process.env.WEBHOOK_SENDER,
     webhookRequireHttps: process.env.WEBHOOK_REQUIRE_HTTPS,
     rateLimiter: process.env.RATE_LIMITER,
+    blobStorageEnabled: process.env.BLOB_STORAGE_ENABLED,
+    blobStorageType: process.env.BLOB_STORAGE_TYPE,
+    blobKeyPrefix: process.env.BLOB_KEY_PREFIX,
+    allowPersistence: process.env.ALLOW_PERSISTENCE,
+    maxBlobBytes: process.env.MAX_BLOB_BYTES ? parseBytes(process.env.MAX_BLOB_BYTES) : undefined,
+    uploadWindowMs: process.env.UPLOAD_WINDOW_MS,
+    maxUploadPartBytes: process.env.MAX_UPLOAD_PART_BYTES
+      ? parseBytes(process.env.MAX_UPLOAD_PART_BYTES)
+      : undefined,
+    uploadTokenLength: process.env.UPLOAD_TOKEN_LENGTH,
+    blobIdLength: process.env.BLOB_ID_LENGTH,
+    s3Bucket: process.env.S3_BUCKET,
+    s3Region: process.env.S3_REGION,
+    s3Endpoint: process.env.S3_ENDPOINT,
+    s3AccessKeyId: process.env.S3_ACCESS_KEY_ID,
+    s3SecretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
+    s3ForcePathStyle: process.env.S3_FORCE_PATH_STYLE,
+    s3ServerSideEncryption: process.env.S3_SERVER_SIDE_ENCRYPTION,
   });
 })();
