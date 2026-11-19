@@ -1,4 +1,4 @@
-import { Client } from './client';
+import { Client, ErrorStreamedPayload, ErrorUnexpectedStatus } from './client';
 
 // Minimal in-memory stand-in for the vault API so we can exercise the full
 // create -> read crypto pipeline (both layers, verification hash, versioned key)
@@ -86,5 +86,38 @@ describe('Client create -> read round trip', () => {
     expect(pwEntry.encryption.passwordAlgorithm).toBe('ml-kem-768-argon2');
     expect(noPwEntry.encryption.passwordAlgorithm).toBeUndefined();
     expect(noPwEntry.encryption.algorithm).toBe('ml-kem-768-2');
+  });
+});
+
+describe('Client read negotiation', () => {
+  const origFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = origFetch;
+  });
+
+  const answering = (status: number, body: string, seen: { accept?: string }) =>
+    (async (_url: string | URL | Request, init?: RequestInit) => {
+      seen.accept = (init?.headers as Record<string, string>)?.Accept;
+      return new Response(body, { status, headers: { 'content-type': 'application/json' } });
+    }) as unknown as typeof fetch;
+
+  it('asks for JSON only, and reports a streamed entry the server refused', async () => {
+    const seen: { accept?: string } = {};
+    globalThis.fetch = answering(406, JSON.stringify({ stored: 'stream' }), seen);
+
+    await expect(
+      new Client({ apiUrl: 'http://vault.test' }).read('id', 'key'),
+    ).rejects.toBeInstanceOf(ErrorStreamedPayload);
+    // Naming only JSON is what makes the server refuse instead of burning.
+    expect(seen.accept).toBe('application/json');
+  });
+
+  it('treats an unrecognised 406 as an unexpected status', async () => {
+    globalThis.fetch = answering(406, 'nope', {});
+
+    await expect(
+      new Client({ apiUrl: 'http://vault.test' }).read('id', 'key'),
+    ).rejects.toBeInstanceOf(ErrorUnexpectedStatus);
   });
 });

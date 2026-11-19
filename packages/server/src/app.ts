@@ -26,6 +26,8 @@ import {
   generateRandomString,
   INLINE_PAYLOAD_MAX_BYTES,
   ErrorInvalidKeyAndOrPassword,
+  ErrorPayloadNotAcceptable,
+  payloadNotAcceptableResponseSchema,
   type Vault,
   type VaultReadResult,
   createVaultRequestSchema,
@@ -42,6 +44,7 @@ import { readFileSync } from 'node:fs';
 import { Readable } from 'node:stream';
 import { buildObjectKey, MAX_PARTS, MIN_PART_SIZE, type BlobStorage } from './storage/index.js';
 import { validatePart, type UploadStore } from './vault/uploads.js';
+import { acceptedPayloads } from './negotiation.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -49,6 +52,18 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const favicon = readFileSync(join(__dirname, 'assets', 'favicon.ico'));
+
+/** Adds to `Vary` rather than replacing it; the CORS hook may already have set `Origin`. */
+const addVary = (res: FastifyReply, field: string) => {
+  const existing = res.getHeader('Vary');
+  const fields = (typeof existing === 'string' ? existing.split(',') : [])
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (!fields.some((value) => value.toLowerCase() === field.toLowerCase())) {
+    fields.push(field);
+  }
+  res.header('Vary', fields.join(', '));
+};
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -355,7 +370,7 @@ export const initApp = async (config: Config, deps: AppDeps) => {
     exposeHeadRoute: false,
     schema: {
       description:
-        'Retrieves the content of a vault entry. If the entry is configured for burn after reading, it will be deleted after this request. IP restrictions and read count limits are enforced.',
+        'Retrieves the content of a vault entry. If the entry is configured for burn after reading, it will be deleted after this request. IP restrictions and read count limits are enforced. Inline entries are answered as JSON; streamed entries as application/octet-stream, and only to readers whose Accept header names application/octet-stream explicitly (wildcards do not count). When the key is correct but the reader did not accept the stored kind, the answer is 406 and the entry is neither burned nor counted.',
       tags: ['vault'],
       summary: 'Retrieve vault entry',
       params: readVaultParamsSchema,
@@ -367,11 +382,21 @@ export const initApp = async (config: Config, deps: AppDeps) => {
         // stream through one would defeat the purpose.
         404: z.null().describe('Vault entry not found'),
         400: z.null().describe('Invalid key and/or password'),
+        406: payloadNotAcceptableResponseSchema.describe(
+          'The key is correct but the entry is stored in a form this reader did not accept. Nothing was burned or counted.',
+        ),
       },
     },
     async handler(req, res) {
+      // The representation depends on Accept, so caches must key on it.
+      addVary(res as unknown as FastifyReply, 'Accept');
       try {
-        const result = await vault.get(req.params.vaultId, req.query.h, req.ip);
+        const result = await vault.get(
+          req.params.vaultId,
+          req.query.h,
+          req.ip,
+          acceptedPayloads(req.headers.accept),
+        );
         if (!result) {
           return res.status(404).send(null);
         }
@@ -394,6 +419,9 @@ export const initApp = async (config: Config, deps: AppDeps) => {
       } catch (error) {
         if (error instanceof ErrorInvalidKeyAndOrPassword) {
           return res.status(400).send(null);
+        }
+        if (error instanceof ErrorPayloadNotAcceptable) {
+          return res.status(406).send({ stored: error.stored });
         }
 
         throw error;
@@ -534,15 +562,23 @@ export const initApp = async (config: Config, deps: AppDeps) => {
             .number()
             .int()
             .positive()
-            .max(config.maxBlobBytes)
-            .describe('total ciphertext byte length'),
+            .describe(`total ciphertext byte length, at most ${config.maxBlobBytes}`),
         }),
         response: {
           201: createStreamResponseSchema,
           400: z.object({ msg: z.string() }).describe('Webhook URL rejected'),
+          413: z.object({ msg: z.string() }).describe('Declared size exceeds the maximum'),
         },
       },
       async handler(req, res) {
+        // Checked here rather than in the schema so an oversized payload gets
+        // 413, which clients map to "too large", instead of a generic 400.
+        if (req.body.size > config.maxBlobBytes) {
+          return res
+            .status(413)
+            .send({ msg: `payload exceeds the maximum of ${config.maxBlobBytes} bytes` });
+        }
+
         if (req.body.wh) {
           try {
             await assertWebhookUrlAllowed(req.body.wh.u, {
@@ -600,7 +636,7 @@ export const initApp = async (config: Config, deps: AppDeps) => {
       },
       schema: {
         description:
-          'Uploads one part of a streamed payload. Parts may be any size the client chooses, provided every part except the one completing the payload is at least the advertised minimum.',
+          'Uploads one part of a streamed payload. Parts may be any size the client chooses, provided every part except the one completing the payload is at least the advertised minimum. Re-sending a part number replaces the earlier attempt, so a part whose response was lost can be retried.',
         tags: ['vault'],
         summary: 'Upload one part',
         params: uploadPartParamsSchema,
@@ -609,6 +645,7 @@ export const initApp = async (config: Config, deps: AppDeps) => {
           204: z.null(),
           404: z.null().describe('No open upload for this id and token'),
           409: z.null().describe('Part rejected'),
+          413: z.object({ msg: z.string() }).describe('Part exceeds the per-part size limit'),
         },
       },
       async handler(req, res) {
@@ -618,15 +655,20 @@ export const initApp = async (config: Config, deps: AppDeps) => {
         }
 
         const body = req.body as Buffer;
-        const parts = await uploadStore.listParts(req.params.vaultId);
-        if (parts.some((part) => part.partNumber === req.params.partNumber)) {
-          return res.status(409).send(null);
-        }
+        // A part number seen before is a retry, typically after a response was
+        // lost. Storage keeps the last upload of a part number, and the client
+        // re-sends byte-identical frames, so the new attempt replaces the old
+        // one and is sized against every *other* part. Two concurrent attempts
+        // carry the same bytes and therefore the same ETag, so whichever is
+        // recorded last still matches what storage holds.
+        const otherParts = (await uploadStore.listParts(req.params.vaultId)).filter(
+          (part) => part.partNumber !== req.params.partNumber,
+        );
 
         const validation = validatePart({
           partNumber: req.params.partNumber,
           contentLength: body.length,
-          receivedBytes: parts.reduce((total, part) => total + part.size, 0),
+          receivedBytes: otherParts.reduce((total, part) => total + part.size, 0),
           expectedBytes: pending.e,
         });
         if (!validation.ok) {

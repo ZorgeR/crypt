@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Run the full suite (Redis-backed server tests and Playwright e2e) on any
+  # branch from the Actions tab or `gh workflow run CI --ref <branch>`.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -70,9 +73,22 @@ jobs:
       - name: Install Playwright Chromium
         run: pnpm --filter @crypt.fyi/web exec playwright install chromium --with-deps
 
-      - name: E2E (create/read/burn + password under production CSP)
+      - name: E2E (create/read/burn, password, streamed files under production CSP)
         run: pnpm test:e2e
         env:
           CI: true
           VITE_API_URL: http://localhost:4322
           REDIS_URL: redis://127.0.0.1:6379
+
+      # Traces (retries run with trace: on-first-retry) and screenshots are the
+      # only way to see what the browser did in a failed run.
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            packages/web/playwright-report/
+            packages/web/test-results/
+          retention-days: 7
+          if-no-files-found: ignore

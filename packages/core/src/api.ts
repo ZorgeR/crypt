@@ -71,6 +71,25 @@ export const readVaultQuerySchema = z.object({
 });
 export type ReadVaultQuery = z.infer<typeof readVaultQuerySchema>;
 
+/**
+ * Media types for `GET /vault/{id}`. A reader names the kinds it can decode in
+ * `Accept`; streamed entries are only sent to readers that name
+ * `application/octet-stream` explicitly, because every legacy client sends a
+ * wildcard and cannot parse the container.
+ */
+export const INLINE_MEDIA_TYPE = 'application/json';
+export const STREAM_MEDIA_TYPE = 'application/octet-stream';
+
+/**
+ * Body of the 406 a read receives when its key is right but the entry is of a
+ * kind it did not accept. Nothing is burned or counted, so the caller can retry
+ * with the right reader.
+ */
+export const payloadNotAcceptableResponseSchema = z.object({
+  stored: z.enum(['inline', 'stream']).describe('how the entry is stored'),
+});
+export type PayloadNotAcceptableResponse = z.infer<typeof payloadNotAcceptableResponseSchema>;
+
 export const readVaultResponseSchema = vaultValueSchema.pick({
   c: true,
   b: true,

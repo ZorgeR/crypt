@@ -12,7 +12,13 @@ import { buildObjectKey } from './storage/index.js';
 import { MIN_PART_SIZE } from './storage/types.js';
 import { Redis } from 'ioredis';
 import { Client } from 'undici';
-import { StreamClient, blobToSource } from '@crypt.fyi/core';
+import {
+  StreamClient,
+  blobToSource,
+  Client as VaultClient,
+  ErrorInlinePayload,
+  ErrorStreamedPayload,
+} from '@crypt.fyi/core';
 
 // Small enough to keep the suite quick, large enough that a payload still needs
 // several parts. The storage minimum is what forces the shape of these tests.
@@ -101,6 +107,12 @@ const complete = (ctx: Ctx, id: string, ut: string) =>
     body: JSON.stringify({ ut }),
   });
 
+/** What a streaming reader sends; anything less is treated as a legacy reader. */
+const STREAM_ACCEPT = { Accept: 'application/octet-stream' };
+
+const readStreamed = (ctx: Ctx, id: string, h = 'hash-abc') =>
+  ctx.client.request({ method: 'GET', path: `/vault/${id}?h=${h}`, headers: STREAM_ACCEPT });
+
 const fill = (size: number, seed: number) => Buffer.alloc(size, seed);
 
 describe('streamed payloads', () => {
@@ -130,10 +142,7 @@ describe('streamed payloads', () => {
     expect((await putPart(ctx, body.id, body.ut, 2, last)).statusCode).toBe(204);
     expect((await complete(ctx, body.id, body.ut)).statusCode).toBe(201);
 
-    const read = await ctx.client.request({
-      method: 'GET',
-      path: `/vault/${body.id}?h=hash-abc`,
-    });
+    const read = await readStreamed(ctx, body.id);
     expect(read.statusCode).toBe(200);
     expect(read.headers['content-type']).toBe('application/octet-stream');
     expect(read.headers['x-crypt-burned']).toBe('true');
@@ -150,10 +159,7 @@ describe('streamed payloads', () => {
 
     // The vault entry is only written on completion, so mid-upload the id is
     // indistinguishable from one that never existed.
-    const early = await ctx.client.request({
-      method: 'GET',
-      path: `/vault/${body.id}?h=hash-abc`,
-    });
+    const early = await readStreamed(ctx, body.id);
     expect(early.statusCode).toBe(404);
     await early.body.dump();
 
@@ -164,10 +170,7 @@ describe('streamed payloads', () => {
     await putPart(ctx, body.id, body.ut, 1, payload);
     await complete(ctx, body.id, body.ut);
 
-    const after = await ctx.client.request({
-      method: 'GET',
-      path: `/vault/${body.id}?h=hash-abc`,
-    });
+    const after = await readStreamed(ctx, body.id);
     expect(after.statusCode).toBe(200);
     await after.body.dump();
   });
@@ -180,17 +183,14 @@ describe('streamed payloads', () => {
 
     expect(ctx.blobStorage.size()).toBe(1);
 
-    const read = await ctx.client.request({ method: 'GET', path: `/vault/${body.id}?h=hash-abc` });
+    const read = await readStreamed(ctx, body.id);
     await read.body.arrayBuffer();
 
     // The delete is scheduled on stream end; give the event loop a turn.
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(ctx.blobStorage.size()).toBe(0);
 
-    const second = await ctx.client.request({
-      method: 'GET',
-      path: `/vault/${body.id}?h=hash-abc`,
-    });
+    const second = await readStreamed(ctx, body.id);
     expect(second.statusCode).toBe(404);
     await second.body.dump();
   });
@@ -226,15 +226,31 @@ describe('streamed payloads', () => {
     await tooBig.body.dump();
   });
 
-  it('rejects a duplicate part number', async () => {
+  it('accepts a re-sent part and keeps a single copy of it', async () => {
     const first = fill(PART, 0x88);
     const last = fill(512, 0x99);
     const { body } = await openUpload(ctx, { size: first.length + last.length, frames: 2 });
 
     expect((await putPart(ctx, body.id, body.ut, 1, first)).statusCode).toBe(204);
-    const duplicate = await putPart(ctx, body.id, body.ut, 1, first);
-    expect(duplicate.statusCode).toBe(409);
-    await duplicate.body.dump();
+    // What a client retry looks like after a lost response: the same bytes
+    // under the same part number. It must replace, not double-count.
+    expect((await putPart(ctx, body.id, body.ut, 1, first)).statusCode).toBe(204);
+    expect((await putPart(ctx, body.id, body.ut, 2, last)).statusCode).toBe(204);
+    expect((await complete(ctx, body.id, body.ut)).statusCode).toBe(201);
+
+    const read = await readStreamed(ctx, body.id);
+    expect(read.statusCode).toBe(200);
+    const received = Buffer.from(await read.body.arrayBuffer());
+    expect(received.equals(Buffer.concat([first, last]))).toBe(true);
+  });
+
+  it('still rejects a re-sent part that would overflow the declared size', async () => {
+    const { body } = await openUpload(ctx, { size: 1024, frames: 1 });
+
+    expect((await putPart(ctx, body.id, body.ut, 1, fill(1024, 0x12))).statusCode).toBe(204);
+    const oversized = await putPart(ctx, body.id, body.ut, 1, fill(2048, 0x12));
+    expect(oversized.statusCode).toBe(409);
+    await oversized.body.dump();
   });
 
   it('refuses to complete when the uploaded bytes do not match the declaration', async () => {
@@ -246,10 +262,7 @@ describe('streamed payloads', () => {
     await early.body.dump();
 
     // The entry must not have been published by the failed completion.
-    const read = await ctx.client.request({
-      method: 'GET',
-      path: `/vault/${body.id}?h=hash-abc`,
-    });
+    const read = await readStreamed(ctx, body.id);
     expect(read.statusCode).toBe(404);
     await read.body.dump();
   });
@@ -272,12 +285,14 @@ describe('streamed payloads', () => {
     expect(ctx.blobStorage.size()).toBe(0);
   });
 
-  it('rejects a payload larger than the configured maximum', async () => {
-    const { status } = await openUpload(ctx, {
+  it('rejects a payload larger than the configured maximum with 413', async () => {
+    // 413 rather than a validation 400, so clients can say "too large".
+    const { status, body } = await openUpload(ctx, {
       size: ctx.config.maxBlobBytes + 1,
       frames: 1,
     });
-    expect(status).toBe(400);
+    expect(status).toBe(413);
+    expect(typeof body.msg).toBe('string');
   });
 
   it('keeps the inline path working unchanged', async () => {
@@ -323,15 +338,12 @@ describe('streamed payloads / retention', () => {
     await putPart(ctx, body.id, body.ut, 1, payload);
     await complete(ctx, body.id, body.ut);
 
-    const read = await ctx.client.request({ method: 'GET', path: `/vault/${body.id}?h=hash-abc` });
+    const read = await readStreamed(ctx, body.id);
     await read.body.arrayBuffer();
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     // The link is dead but the bytes survive — the point of the retention flag.
-    const second = await ctx.client.request({
-      method: 'GET',
-      path: `/vault/${body.id}?h=hash-abc`,
-    });
+    const second = await readStreamed(ctx, body.id);
     expect(second.statusCode).toBe(404);
     await second.body.dump();
     expect(ctx.blobStorage.size()).toBe(1);
@@ -647,6 +659,140 @@ describe('streamed payloads / regressions', () => {
     const payload = (await res.body.json()) as { msg?: string };
     expect(typeof payload.msg).toBe('string');
   });
+});
+
+describe('streamed payloads / content negotiation', () => {
+  let ctx: Ctx;
+
+  beforeEach(async () => {
+    ctx = await initStreamTest();
+  });
+
+  afterEach(async () => {
+    await ctx.app.shutdown();
+    await ctx.app.fastify.close();
+    await ctx.client.close();
+  });
+
+  const createStreamed = async (fields: Record<string, unknown> = {}) => {
+    const payload = fill(1024, 0x5a);
+    const { body } = await openUpload(ctx, { size: payload.length, frames: 1, ...fields });
+    await (await putPart(ctx, body.id, body.ut, 1, payload)).body.dump();
+    await (await complete(ctx, body.id, body.ut)).body.dump();
+    return { id: body.id, payload };
+  };
+
+  const createInline = async () => {
+    const created = await ctx.client.request({
+      method: 'POST',
+      path: '/vault',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        c: 'inline-secret',
+        b: true,
+        h: 'inline-hash',
+        ttl: 60_000,
+        m: { encryption: { algorithm: 'aes-256-gcm' } },
+      }),
+    });
+    expect(created.statusCode).toBe(201);
+    return ((await created.body.json()) as { id: string }).id;
+  };
+
+  it('refuses a legacy reader with 406 and leaves the streamed entry intact', async () => {
+    const { id, payload } = await createStreamed();
+
+    // No header, a wildcard, or JSON: everything a pre-streaming client sends.
+    for (const accept of [undefined, '*/*', 'application/json']) {
+      const refused = await ctx.client.request({
+        method: 'GET',
+        path: `/vault/${id}?h=hash-abc`,
+        headers: accept ? { Accept: accept } : {},
+      });
+      expect(refused.statusCode).toBe(406);
+      expect(refused.headers.vary).toContain('Accept');
+      expect(await refused.body.json()).toEqual({ stored: 'stream' });
+    }
+
+    // Burn-after-reading, yet still readable: the refusals consumed nothing.
+    const read = await readStreamed(ctx, id);
+    expect(read.statusCode).toBe(200);
+    expect(read.headers['x-crypt-burned']).toBe('true');
+    expect(Buffer.from(await read.body.arrayBuffer()).equals(payload)).toBe(true);
+  });
+
+  it('refuses a streaming-only reader with 406 and leaves the inline entry intact', async () => {
+    const id = await createInline();
+
+    const refused = await readStreamed(ctx, id, 'inline-hash');
+    expect(refused.statusCode).toBe(406);
+    expect(await refused.body.json()).toEqual({ stored: 'inline' });
+
+    const read = await ctx.client.request({ method: 'GET', path: `/vault/${id}?h=inline-hash` });
+    expect(read.statusCode).toBe(200);
+    expect(((await read.body.json()) as { c: string }).c).toBe('inline-secret');
+  });
+
+  it('checks the key before revealing how an entry is stored', async () => {
+    const { id } = await createStreamed();
+
+    // Wrong hash and the wrong kind: the answer must be the key failure, so a
+    // caller without the key learns nothing about the payload.
+    const res = await ctx.client.request({ method: 'GET', path: `/vault/${id}?h=wrong-hash` });
+    expect(res.statusCode).toBe(400);
+    await res.body.dump();
+  });
+
+  it('does not spend a read count on a refused read', async () => {
+    const { id } = await createStreamed({ b: false, rc: 2 });
+
+    for (let i = 0; i < 3; i++) {
+      const refused = await ctx.client.request({ method: 'GET', path: `/vault/${id}?h=hash-abc` });
+      expect(refused.statusCode).toBe(406);
+      await refused.body.dump();
+    }
+
+    const first = await readStreamed(ctx, id);
+    expect(first.statusCode).toBe(200);
+    expect(first.headers['x-crypt-burned']).toBe('false');
+    await first.body.dump();
+
+    const second = await readStreamed(ctx, id);
+    expect(second.statusCode).toBe(200);
+    expect(second.headers['x-crypt-burned']).toBe('true');
+    await second.body.dump();
+
+    const third = await readStreamed(ctx, id);
+    expect(third.statusCode).toBe(404);
+    await third.body.dump();
+  });
+
+  it('lets each client recover from reading the wrong kind without losing the secret', async () => {
+    const streamClient = new StreamClient({ apiUrl: ctx.baseUrl });
+    const vaultClient = new VaultClient({ apiUrl: ctx.baseUrl });
+
+    const content = new Uint8Array(8192).fill(7);
+    const streamed = await streamClient.create({
+      content,
+      metadata: { name: 'big.bin', type: 'application/octet-stream' },
+      b: true,
+      ttl: 60_000,
+      m: { encryption: { algorithm: 'ml-kem-768-stream' } },
+    });
+    // The CLI and the inline web view use this reader.
+    await expect(vaultClient.read(streamed.id, streamed.key)).rejects.toBeInstanceOf(
+      ErrorStreamedPayload,
+    );
+    const read = await streamClient.read(streamed.id, streamed.key);
+    expect(Buffer.from(read.content).equals(Buffer.from(content))).toBe(true);
+
+    const inline = await vaultClient.create({ c: 'inline via client', b: true, ttl: 60_000 });
+    await expect(streamClient.read(inline.id, inline.key)).rejects.toBeInstanceOf(
+      ErrorInlinePayload,
+    );
+    const inlineRead = await vaultClient.read(inline.id, inline.key);
+    expect(inlineRead.c).toBe('inline via client');
+  }, 60_000);
 });
 
 describe('client-facing config', () => {

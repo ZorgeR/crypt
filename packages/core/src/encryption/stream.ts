@@ -41,6 +41,17 @@ export const AAD_LENGTH = HEADER_HASH_LENGTH + 8 + 1;
 /** Bytes needed before `wkLen` is known and the rest of the prefix can be read. */
 export const HEADER_FIXED_LENGTH = 16;
 
+/**
+ * Upper bounds on the two header lengths a reader must act on before anything
+ * is authenticated. Both arrive as u32s, so without a cap a corrupt or hostile
+ * response could make a streaming reader allocate gigabytes just to buffer the
+ * header. The bounds are far above anything the encryptor produces: a wrapped
+ * key is ~1.6 KB (~3.7 KB with a password), and the metadata frame is a small
+ * JSON object plus a 16-byte tag.
+ */
+export const MAX_WRAPPED_KEY_LENGTH = 16 * 1024;
+export const MAX_META_LENGTH = 64 * 1024;
+
 const FLAG_PASSWORD_REQUIRED = 0x01;
 const FLAG_RESERVED_MASK = 0xfe;
 /** The metadata frame is counter 0; data frames start at 1. */
@@ -278,6 +289,13 @@ export const createStreamEncryptor = async (
     // the prefix can be finalised — and hashed — ahead of encrypting anything.
     const metaLength = metaPlaintext.length + TAG_LENGTH;
     const prefixLength = 28 + wrappedKeyBytes.length;
+    // Never produce a container that a conforming reader would refuse.
+    if (wrappedKeyBytes.length > MAX_WRAPPED_KEY_LENGTH) {
+      throw new Error(`wrapped key exceeds ${MAX_WRAPPED_KEY_LENGTH} bytes`);
+    }
+    if (metaLength > MAX_META_LENGTH) {
+      throw new Error(`metadata frame exceeds ${MAX_META_LENGTH} bytes; the filename is too long`);
+    }
 
     const prefix = new Uint8Array(prefixLength);
     const view = new DataView(prefix.buffer);
@@ -338,24 +356,7 @@ export const createStreamEncryptor = async (
   }
 };
 
-/**
- * Parses the fixed 16-byte head so a streaming reader knows how many more bytes
- * the prefix needs before it can be parsed in full.
- */
-export const readWrappedKeyLength = (bytes: Uint8Array): number => {
-  if (bytes.length < HEADER_FIXED_LENGTH) {
-    throw new Error(`need at least ${HEADER_FIXED_LENGTH} bytes to read the wrapped key length`);
-  }
-  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(
-    OFF_WK_LEN,
-    false,
-  );
-};
-
-export const parseStreamHeader = (bytes: Uint8Array): StreamHeader => {
-  if (bytes.length < HEADER_FIXED_LENGTH) {
-    throw new Error('container is shorter than the fixed header');
-  }
+const assertContainerHead = (bytes: Uint8Array): void => {
   for (let i = 0; i < STREAM_MAGIC.length; i++) {
     if (bytes[i] !== STREAM_MAGIC[i]) {
       throw new Error('not a CFYI container');
@@ -365,6 +366,38 @@ export const parseStreamHeader = (bytes: Uint8Array): StreamHeader => {
   if (version !== STREAM_VERSION) {
     throw new Error(`unsupported container version ${version}`);
   }
+};
+
+const assertWrappedKeyLength = (wkLen: number): void => {
+  if (wkLen > MAX_WRAPPED_KEY_LENGTH) {
+    throw new Error(`wrapped key length ${wkLen} exceeds ${MAX_WRAPPED_KEY_LENGTH}`);
+  }
+};
+
+/**
+ * Parses the fixed 16-byte head so a streaming reader knows how many more bytes
+ * the prefix needs before it can be parsed in full. The magic, version, and
+ * length bound are checked here, before the caller buffers anything else.
+ */
+export const readWrappedKeyLength = (bytes: Uint8Array): number => {
+  if (bytes.length < HEADER_FIXED_LENGTH) {
+    throw new Error(`need at least ${HEADER_FIXED_LENGTH} bytes to read the wrapped key length`);
+  }
+  assertContainerHead(bytes);
+  const wkLen = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(
+    OFF_WK_LEN,
+    false,
+  );
+  assertWrappedKeyLength(wkLen);
+  return wkLen;
+};
+
+export const parseStreamHeader = (bytes: Uint8Array): StreamHeader => {
+  if (bytes.length < HEADER_FIXED_LENGTH) {
+    throw new Error('container is shorter than the fixed header');
+  }
+  assertContainerHead(bytes);
+  const version = bytes[OFF_VERSION];
   const flags = bytes[OFF_FLAGS];
   if ((flags & FLAG_RESERVED_MASK) !== 0) {
     throw new Error('reserved flag bits must be zero');
@@ -379,6 +412,7 @@ export const parseStreamHeader = (bytes: Uint8Array): StreamHeader => {
 
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const wkLen = view.getUint32(OFF_WK_LEN, false);
+  assertWrappedKeyLength(wkLen);
   const prefixLength = 28 + wkLen;
   if (bytes.length < prefixLength) {
     throw new Error('container is shorter than its declared header prefix');
@@ -391,6 +425,9 @@ export const parseStreamHeader = (bytes: Uint8Array): StreamHeader => {
   }
   if (metaLength < TAG_LENGTH) {
     throw new Error('metadata frame is shorter than a GCM tag');
+  }
+  if (metaLength > MAX_META_LENGTH) {
+    throw new Error(`metadata frame length ${metaLength} exceeds ${MAX_META_LENGTH}`);
   }
 
   const frameSize = 2 ** frameSizeLog2;

@@ -25,17 +25,14 @@ const SW_URL = '/_download/sw.js';
 const SW_MESSAGE_TYPE = 'crypt.fyi/download';
 /** Above this, a Blob is not a responsible fallback. */
 export const BLOB_SINK_LIMIT = 200 * 1024 * 1024;
+/**
+ * How long to wait, once every byte has been handed to the worker, for its
+ * confirmation that the browser pulled them. A worker from an older build never
+ * sends one, so the download is treated as finished after this.
+ */
+const COMPLETION_GRACE_MS = 30_000;
 
 export type SaveSinkKind = 'file-system-access' | 'service-worker' | 'blob';
-
-export type SaveSink = {
-  kind: SaveSinkKind;
-  writable: WritableStream<Uint8Array>;
-  /** Resolves once the bytes have landed. */
-  done: Promise<void>;
-  /** Abandons the download and releases anything held for it. */
-  abort(reason?: unknown): Promise<void>;
-};
 
 type SaveSinkOptions = {
   filename: string;
@@ -89,6 +86,23 @@ const newDownloadId = (): string => {
     .replace(/=+$/, '');
 };
 
+/**
+ * A promise with its settle functions exposed. Callers await `done` only after
+ * a successful transfer, so on the abort path it rejects with nobody listening;
+ * the attached no-op handler keeps that from surfacing as an unhandled
+ * rejection while still delivering it to anyone who does await it.
+ */
+const deferred = () => {
+  let resolve!: () => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<void>((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  promise.catch(() => undefined);
+  return { promise, resolve, reject };
+};
+
 // The worker is registered on demand and unregistered once the last download
 // finishes, so it is not resident while the app is merely open.
 let activeDownloads = 0;
@@ -110,6 +124,8 @@ const armWorker = async (
   id: string,
   stream: ReadableStream<Uint8Array>,
   options: SaveSinkOptions,
+  /** Called when the worker reports the browser has pulled every byte. */
+  onComplete: () => void,
 ): Promise<void> => {
   const registration = await navigator.serviceWorker.register(SW_URL);
 
@@ -141,16 +157,27 @@ const armWorker = async (
 
   // Wait for the worker to confirm it is holding the stream before navigating.
   // Without the ack there is a window in which a terminated worker would drop
-  // the entry and the iframe would 404.
+  // the entry and the iframe would 404. The port then stays open for the
+  // worker's completion notice, which is what `done` waits on.
   const channel = new MessageChannel();
   const acked = new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('download worker did not respond')), 10_000);
-    channel.port1.onmessage = (event: MessageEvent<{ ok: boolean; reason?: string }>) => {
-      clearTimeout(timeout);
+    const timeout = setTimeout(() => {
       channel.port1.close();
+      reject(new Error('download worker did not respond'));
+    }, 10_000);
+    channel.port1.onmessage = (
+      event: MessageEvent<{ ok?: boolean; reason?: string; type?: string }>,
+    ) => {
+      if (event.data?.type === 'complete') {
+        channel.port1.close();
+        onComplete();
+        return;
+      }
+      clearTimeout(timeout);
       if (event.data?.ok) {
         resolve();
       } else {
+        channel.port1.close();
         reject(new Error(event.data?.reason ?? 'worker refused'));
       }
     };
@@ -187,7 +214,14 @@ export type PendingSaveSink = {
   writable: WritableStream<Uint8Array>;
   /** Call once the container's metadata is known. */
   arm(info: { filename: string; size: number }): Promise<void>;
+  /**
+   * Settles once the download is over: resolves when every byte has landed —
+   * on disk, or with the browser's download manager for the service worker —
+   * and rejects if the sink is aborted. Await it after the transfer finishes;
+   * whatever the sink held for the download is released when it settles.
+   */
   done: Promise<void>;
+  /** Abandons the download and releases anything held for it. */
   abort(reason?: unknown): Promise<void>;
 };
 
@@ -199,8 +233,40 @@ export const createPendingSaveSink = async (suggestedName: string): Promise<Pend
   // is known — so it can only ever offer a placeholder, and the saved file ends
   // up called that. A correct filename beats choosing the folder.
   if (supportsServiceWorkerSink()) {
-    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+    const done = deferred();
     let closeFrame: (() => void) | undefined;
+    let armed = false;
+    let settled = false;
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+
+    // Ends the download exactly once, however it ends: completion, the grace
+    // timeout, a failed arm, or an abort. Only an armed download holds a slot
+    // in the worker count, so only an armed one gives it back.
+    const settle = async (outcome: { ok: true } | { ok: false; reason: unknown }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(graceTimer);
+      closeFrame?.();
+      closeFrame = undefined;
+      if (armed) {
+        await releaseWorker();
+      }
+      if (outcome.ok) {
+        done.resolve();
+      } else {
+        done.reject(outcome.reason);
+      }
+    };
+
+    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>({
+      // Every byte has now been handed to the worker, but the browser may not
+      // have pulled the last of them yet; removing the iframe or unregistering
+      // the worker here could cut the download short. Wait for the worker's
+      // confirmation, bounded in case it never comes.
+      flush() {
+        graceTimer = setTimeout(() => void settle({ ok: true }), COMPLETION_GRACE_MS);
+      },
+    });
 
     return {
       kind: 'service-worker',
@@ -208,22 +274,21 @@ export const createPendingSaveSink = async (suggestedName: string): Promise<Pend
       arm: async ({ filename, size }) => {
         const id = newDownloadId();
         activeDownloads += 1;
+        armed = true;
         try {
-          await armWorker(id, readable, { filename, size });
+          await armWorker(id, readable, { filename, size }, () => void settle({ ok: true }));
         } catch (error) {
-          await releaseWorker();
+          await settle({ ok: false, reason: error });
           throw error;
         }
         closeFrame = openDownloadFrame(id);
       },
-      done: Promise.resolve().then(async () => {
-        closeFrame?.();
-        await releaseWorker();
-      }),
+      done: done.promise,
       abort: async (reason) => {
-        closeFrame?.();
-        await writable.abort?.(reason).catch(() => undefined);
-        await releaseWorker();
+        // Usually already aborted through the reader's own writer, in which
+        // case the stream is locked and this is a no-op.
+        await writable.abort(reason).catch(() => undefined);
+        await settle({ ok: false, reason });
       },
     };
   }
@@ -233,24 +298,36 @@ export const createPendingSaveSink = async (suggestedName: string): Promise<Pend
   const picker = getSaveFilePicker();
   if (picker) {
     const handle = await picker({ suggestedName });
-    const writable = await handle.createWritable();
+    const fileWriter = (await handle.createWritable()).getWriter();
+    const done = deferred();
+    // Wrapped so `done` follows the file's own close, which resolves only once
+    // the write has been committed to disk.
+    const writable = new WritableStream<Uint8Array>({
+      write: (chunk) => fileWriter.write(chunk),
+      close: async () => {
+        await fileWriter.close();
+        done.resolve();
+      },
+      abort: async (reason) => {
+        await fileWriter.abort(reason).catch(() => undefined);
+        done.reject(reason);
+      },
+    });
     return {
       kind: 'file-system-access',
       writable,
       arm: async () => {},
-      done: Promise.resolve(),
+      done: done.promise,
       abort: async (reason) => {
-        await writable.abort?.(reason);
+        await writable.abort(reason).catch(() => undefined);
+        done.reject(reason);
       },
     };
   }
 
   const chunks: Uint8Array[] = [];
   let name = suggestedName;
-  let settled: () => void = () => {};
-  const done = new Promise<void>((resolve) => {
-    settled = resolve;
-  });
+  const done = deferred();
 
   const writable = new WritableStream<Uint8Array>({
     write(chunk) {
@@ -264,7 +341,7 @@ export const createPendingSaveSink = async (suggestedName: string): Promise<Pend
       link.download = name;
       link.click();
       setTimeout(() => URL.revokeObjectURL(url), 60_000);
-      settled();
+      done.resolve();
     },
   });
 
@@ -279,9 +356,11 @@ export const createPendingSaveSink = async (suggestedName: string): Promise<Pend
       }
       name = filename;
     },
-    done,
+    done: done.promise,
     abort: async (reason) => {
-      await writable.abort?.(reason).catch(() => undefined);
+      await writable.abort(reason).catch(() => undefined);
+      chunks.length = 0;
+      done.reject(reason);
     },
   };
 };

@@ -20,8 +20,10 @@ import { clipboardCopy } from '@/lib/clipboardCopy';
 import { formatDistanceToNow } from 'date-fns';
 import { Loader } from '@/components/ui/loader';
 import {
+  ErrorInlinePayload,
   ErrorInvalidKeyAndOrPassword,
   ErrorNotFound,
+  ErrorStreamedPayload,
   ErrorUnexpectedStatus,
   StreamClient,
   sleep,
@@ -34,15 +36,61 @@ export function ViewPage() {
   const { id } = useParams({ from: '/$id' });
   const search = useSearch({ from: '/$id' });
 
-  // Streamed payloads are written straight to disk and never held in the tab,
-  // so they take a separate view rather than the in-page reveal.
-  if (search.s) {
-    return <StreamedVaultView key={id} id={id} isPasswordSet={Boolean(search.p)} />;
-  }
-
   // TanStack reuses this file-route component across vault IDs. Bound all
   // key-bearing local state to the public vault ID without keying on the hash.
-  return <VaultView key={id} id={id} isPasswordSet={Boolean(search.p)} />;
+  return (
+    <VaultViewSwitch
+      key={id}
+      id={id}
+      isPasswordSet={Boolean(search.p)}
+      streamedHint={Boolean(search.s)}
+    />
+  );
+}
+
+/**
+ * Credentials the user typed into one view, carried into the other so a
+ * switch does not make them type a long key twice. A key from the URL
+ * fragment is not carried: it is still in the address bar.
+ */
+type TypedCredentials = { manualKey: string; password: string };
+
+/**
+ * Picks the inline or the streamed view. The `s` query flag is only a hint:
+ * a link can lose it, or carry it wrongly. The server refuses (406) a read of
+ * a kind the reader did not ask for before anything is burned, so a wrong hint
+ * costs one switch rather than the secret.
+ */
+function VaultViewSwitch({
+  id,
+  isPasswordSet,
+  streamedHint,
+}: VaultViewProps & { streamedHint: boolean }) {
+  const [view, setView] = useState<{ streamed: boolean; carried?: TypedCredentials }>({
+    streamed: streamedHint,
+  });
+
+  // Streamed payloads are written straight to disk and never held in the tab,
+  // so they take a separate view rather than the in-page reveal.
+  if (view.streamed) {
+    return (
+      <StreamedVaultView
+        id={id}
+        isPasswordSet={isPasswordSet}
+        carried={view.carried}
+        onInline={(carried) => setView({ streamed: false, carried })}
+      />
+    );
+  }
+
+  return (
+    <VaultView
+      id={id}
+      isPasswordSet={isPasswordSet}
+      carried={view.carried}
+      onStreamed={(carried) => setView({ streamed: true, carried })}
+    />
+  );
 }
 
 /**
@@ -50,9 +98,17 @@ export function ViewPage() {
  * decrypted frame by frame into a save sink, so a multi-gigabyte file never
  * has to fit in memory.
  */
-function StreamedVaultView({ id, isPasswordSet }: VaultViewProps) {
+function StreamedVaultView({
+  id,
+  isPasswordSet,
+  carried,
+  onInline,
+}: VaultViewProps & {
+  carried?: TypedCredentials;
+  onInline: (carried: TypedCredentials) => void;
+}) {
   const { t } = useTranslation();
-  const [password, setPassword] = useState('');
+  const [password, setPassword] = useState(carried?.password ?? '');
   const [progress, setProgress] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [outcome, setOutcome] = useState<{ burned: boolean } | null>(null);
@@ -61,7 +117,7 @@ function StreamedVaultView({ id, isPasswordSet }: VaultViewProps) {
   // keyless, where the key is sent separately. Support both, as the inline view
   // does — otherwise a keyless streamed link is unopenable.
   const fragmentKey = typeof window === 'undefined' ? '' : window.location.hash.slice(1).trim();
-  const [manualKey, setManualKey] = useState('');
+  const [manualKey, setManualKey] = useState(carried?.manualKey ?? '');
   const key = fragmentKey || manualKey.trim();
 
   const download = async (event: FormEvent) => {
@@ -102,6 +158,11 @@ function StreamedVaultView({ id, isPasswordSet }: VaultViewProps) {
     } catch (caught) {
       await sink.abort(caught).catch(() => undefined);
       setProgress(null);
+      if (caught instanceof ErrorInlinePayload) {
+        // Stored inline after all; the server refused before burning it.
+        onInline({ manualKey: fragmentKey ? '' : manualKey.trim(), password });
+        return;
+      }
       if (caught instanceof ErrorInvalidKeyAndOrPassword) {
         // Only blame the password when there is one; otherwise the key is what
         // failed, and telling the user to check a password they never had is
@@ -213,19 +274,30 @@ interface VaultViewProps {
 
 type KeySource = 'url' | 'manual' | 'none';
 
-function VaultView({ id, isPasswordSet }: VaultViewProps) {
+function VaultView({
+  id,
+  isPasswordSet,
+  carried,
+  onStreamed,
+}: VaultViewProps & {
+  carried?: TypedCredentials;
+  onStreamed: (carried: TypedCredentials) => void;
+}) {
   const { t } = useTranslation();
 
   // Keep the raw key outside render state and React Query's cache identity.
   // location.hash already includes '#'; slice(1) is the fragment value.
   const initialKey = window.location.hash.slice(1).trim();
-  const decryptionKeyRef = useRef(initialKey);
-  const [keySource, setKeySource] = useState<KeySource>(() => (initialKey ? 'url' : 'none'));
+  const carriedKey = initialKey ? '' : (carried?.manualKey ?? '');
+  const decryptionKeyRef = useRef(initialKey || carriedKey);
+  const [keySource, setKeySource] = useState<KeySource>(() =>
+    initialKey ? 'url' : carriedKey ? 'manual' : 'none',
+  );
   // Mirrored for mutation callbacks, which can close over a stale render.
   const keySourceRef = useRef(keySource);
   keySourceRef.current = keySource;
 
-  const [password, setPassword] = useState('');
+  const [password, setPassword] = useState(carried?.password ?? '');
   const [isRevealed, setIsRevealed] = useState(false);
   const [hasUserConfirmed, setHasUserConfirmed] = useState(false);
   const [credentialError, setCredentialError] = useState<string | null>(null);
@@ -248,7 +320,15 @@ function VaultView({ id, isPasswordSet }: VaultViewProps) {
       setPassword('');
       setCredentialError(null);
     },
-    onError(error) {
+    onError(error, submittedPassword) {
+      if (error instanceof ErrorStreamedPayload) {
+        // A file in object storage; the server refused before burning it.
+        onStreamed({
+          manualKey: keySourceRef.current === 'manual' ? decryptionKeyRef.current : '',
+          password: submittedPassword,
+        });
+        return;
+      }
       if (error instanceof ErrorInvalidKeyAndOrPassword) {
         if (!isPasswordSet && keySourceRef.current === 'manual') {
           decryptionKeyRef.current = '';
@@ -325,6 +405,8 @@ function VaultView({ id, isPasswordSet }: VaultViewProps) {
   const existsFailed = existsQuery.isError && !isRateLimited;
   const unexpectedDecryptError =
     decryptError &&
+    // Handled by switching views; must not flash the connection-error card.
+    !(decryptError instanceof ErrorStreamedPayload) &&
     !(decryptError instanceof ErrorInvalidKeyAndOrPassword) &&
     !(decryptError instanceof ErrorNotFound) &&
     !(decryptError instanceof ErrorUnexpectedStatus && decryptError.status === 429);

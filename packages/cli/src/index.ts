@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
 import { readFileSync, writeFileSync } from 'fs';
-import { Client, vaultValueSchema } from '@crypt.fyi/core';
+import { Client, ErrorStreamedPayload, vaultValueSchema } from '@crypt.fyi/core';
 import chalk from 'chalk';
 import ora from 'ora';
 import { config } from './config.js';
@@ -172,6 +172,16 @@ program
         );
       }
     } catch (error) {
+      if (error instanceof ErrorStreamedPayload) {
+        // The server refused the read before burning it, so the link still works.
+        spinner.fail('This secret is a large file the CLI cannot download yet');
+        console.error(
+          chalk.yellow(
+            'Open the link in a browser to download it. The secret has not been opened or burned.',
+          ),
+        );
+        process.exit(1);
+      }
       spinner.fail('Failed to decrypt content');
       console.error(chalk.red(error instanceof Error ? error.message : 'Unknown error'));
       process.exit(1);
