@@ -25,10 +25,13 @@
  *   sw   -> page port.postMessage({ ok: true })      // armed; safe to navigate
  *   page         <iframe src="/_download/<id>">
  *   sw   -> net  fetch handler answers with the stream as an attachment
+ *   sw   -> page port.postMessage({ type: 'complete' })  // browser pulled every byte
  *
  * The ack matters: it confirms the worker is running and holding the stream
  * before the page triggers the navigation, which closes the window where a
- * terminated worker would drop the entry.
+ * terminated worker would drop the entry. The completion notice matters too:
+ * the page removes the iframe and unregisters this worker only after it, so
+ * cleanup cannot cut off the tail of a download still being pulled.
  *
  * ---------------------------------------------------------------------------
  * Rules this file lives by
@@ -49,7 +52,7 @@ const ID_PATTERN = /^[A-Za-z0-9_-]{16,64}$/;
 /** An armed download the page never collected is dropped after this. */
 const ARM_TTL_MS = 5 * 60 * 1000;
 
-/** id -> { filename, size, stream, armedAt } */
+/** id -> { filename, size, stream, port, armedAt } */
 const pending = new Map();
 
 self.addEventListener('install', () => {
@@ -104,6 +107,7 @@ self.addEventListener('message', (event) => {
     filename: typeof data.filename === 'string' ? data.filename : 'download',
     size: Number.isSafeInteger(data.size) && data.size >= 0 ? data.size : undefined,
     stream: data.stream,
+    port,
     armedAt: Date.now(),
   });
 
@@ -130,6 +134,33 @@ const contentDisposition = (rawName) => {
   const safeName = name || 'download';
   const ascii = safeName.replace(/[^\u0020-\u007e]/g, '_').replace(/["\\]/g, '_');
   return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(safeName)}`;
+};
+
+/**
+ * Passes the stream through unchanged and reports when the browser has pulled
+ * all of it. With a zero high-water mark, `pull` runs only when the consumer
+ * asks for more, so reaching the end here means every chunk has been taken.
+ */
+const reportingCompletion = (stream, port) => {
+  const reader = stream.getReader();
+  return new ReadableStream(
+    {
+      async pull(controller) {
+        const { value, done } = await reader.read();
+        if (done) {
+          controller.close();
+          if (port) port.postMessage({ type: 'complete' });
+          return;
+        }
+        controller.enqueue(value);
+      },
+      // The user cancelled the download: release the page's producer.
+      cancel(reason) {
+        return reader.cancel(reason);
+      },
+    },
+    { highWaterMark: 0 },
+  );
 };
 
 self.addEventListener('fetch', (event) => {
@@ -167,5 +198,7 @@ self.addEventListener('fetch', (event) => {
     headers.set('Content-Length', String(entry.size));
   }
 
-  event.respondWith(new Response(entry.stream, { status: 200, headers }));
+  event.respondWith(
+    new Response(reportingCompletion(entry.stream, entry.port), { status: 200, headers }),
+  );
 });

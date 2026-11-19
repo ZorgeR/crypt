@@ -101,6 +101,16 @@ export const assertSinglePayload = (value: Pick<VaultValue, 'c' | 'blob'>): void
   }
 };
 
+/** How an entry's ciphertext is stored, and therefore how it is answered. */
+export type PayloadKind = 'inline' | 'stream';
+
+/**
+ * Which payload kinds the reader can decode. A read whose entry is of a kind
+ * the reader cannot handle is refused before anything is burned or counted —
+ * otherwise an older client would consume a streamed secret it cannot open.
+ */
+export type AcceptedPayloads = Record<PayloadKind, boolean>;
+
 export type VaultReadResult = Pick<VaultValue, 'c' | 'b' | 'ttl' | 'cd' | 'm' | 'blob'> & {
   /**
    * Whether this read consumed the entry. Callers need it to know when a stored
@@ -115,7 +125,16 @@ export interface Vault {
     value: Omit<VaultValue, 'dt' | 'cd'> & { ttl: number },
     tokens?: { id: string; dt: string },
   ): Promise<{ id: string; dt: string }>;
-  get(id: string, h: string, ip: string): Promise<VaultReadResult | undefined>;
+  /**
+   * Throws `ErrorPayloadNotAcceptable` when the hash is correct but the entry's
+   * kind is not in `accepts`; the entry is left untouched in that case.
+   */
+  get(
+    id: string,
+    h: string,
+    ip: string,
+    accepts: AcceptedPayloads,
+  ): Promise<VaultReadResult | undefined>;
   del(id: string, dt: string): Promise<{ deleted: boolean; blob?: BlobDescriptor }>;
   exists(id: string): Promise<boolean>;
 }

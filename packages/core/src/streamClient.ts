@@ -12,11 +12,30 @@ import {
 import { generateRandomString } from './random';
 import { deriveVerificationHash } from './verification';
 import { KEY_VERSION_2_PREFIX } from './verification';
-import type { CreateStreamRequest, CreateStreamResponse, CreateVaultResponse } from './api';
-import { ErrorNotFound, ErrorInvalidKeyAndOrPassword, ErrorUnexpectedStatus } from './client';
+import {
+  STREAM_MEDIA_TYPE,
+  type CreateStreamRequest,
+  type CreateStreamResponse,
+  type CreateVaultResponse,
+} from './api';
+import {
+  ErrorNotFound,
+  ErrorInvalidKeyAndOrPassword,
+  ErrorUnexpectedStatus,
+  ErrorPayloadTooLarge,
+  ErrorInlinePayload,
+  storedKindOf,
+} from './client';
+import { createFetchRetryClient, FetchRetryError, HTTPError } from './fetchRetry';
 
 /** S3's floor for every part but the last; mirrored from the server. */
 const MIN_PART_SIZE = 5 * 1024 * 1024;
+
+/** Attempts per part, counting the first. */
+const DEFAULT_PART_ATTEMPTS = 4;
+/** First retry delay; doubles per attempt up to {@link MAX_RETRY_DELAY_MS}. */
+const DEFAULT_RETRY_DELAY_MS = 1_000;
+const MAX_RETRY_DELAY_MS = 15_000;
 
 export type ProgressPhase = 'encrypting' | 'uploading' | 'downloading' | 'decrypting';
 
@@ -198,19 +217,39 @@ export class StreamClient {
   private readonly apiUrl: string;
   private readonly keyLength: number;
   private readonly xClient: string | undefined;
+  private readonly putPart: typeof fetch;
 
   constructor({
     apiUrl,
     keyLength = 32,
     xClient,
+    partAttempts = DEFAULT_PART_ATTEMPTS,
+    retryDelayMs = DEFAULT_RETRY_DELAY_MS,
   }: {
     apiUrl: string;
     keyLength?: number;
     xClient?: string;
+    /** Attempts per part, counting the first. */
+    partAttempts?: number;
+    /** First retry delay in milliseconds; doubles on each further attempt. */
+    retryDelayMs?: number;
   }) {
     this.apiUrl = apiUrl;
     this.keyLength = keyLength;
     this.xClient = xClient;
+    // A part is a whole number of frames sealed under a fixed key and counter
+    // nonces, so a re-sent part is byte-identical to the first attempt, and the
+    // server replaces a part number it has already seen. That makes a retry
+    // safe even when the failure was a lost response to a stored part. No
+    // per-request timeout: a slow uplink is not a failure, a dropped one is.
+    this.putPart = createFetchRetryClient({
+      // Resolved per call rather than captured, matching the other requests
+      // here, so a fetch installed after construction (tests, polyfills) is used.
+      fetchFn: (input, init) => fetch(input, init),
+      maxAttempts: partAttempts,
+      requestTimeoutMs: 0,
+      calculateBackoff: (attempt) => Math.min(retryDelayMs * 2 ** attempt, MAX_RETRY_DELAY_MS),
+    });
   }
 
   private headers(contentType = 'application/json') {
@@ -269,7 +308,9 @@ export class StreamClient {
       }),
     });
     if (!opened.ok) {
-      throw new ErrorUnexpectedStatus(opened.status);
+      throw opened.status === 413
+        ? new ErrorPayloadTooLarge()
+        : new ErrorUnexpectedStatus(opened.status);
     }
     const session = (await opened.json()) as CreateStreamResponse;
 
@@ -293,12 +334,13 @@ export class StreamClient {
       }
 
       const body = concat(chunks);
-      const res = await fetch(
-        `${this.apiUrl}/vault/stream/${session.id}/parts/${index + 1}?ut=${encodeURIComponent(session.ut)}`,
-        { method: 'PUT', headers: this.headers('application/octet-stream'), body, signal },
-      );
-      if (!res.ok) {
-        throw new ErrorUnexpectedStatus(res.status);
+      try {
+        await this.putPart(
+          `${this.apiUrl}/vault/stream/${session.id}/parts/${index + 1}?ut=${encodeURIComponent(session.ut)}`,
+          { method: 'PUT', headers: this.headers(STREAM_MEDIA_TYPE), body, signal },
+        );
+      } catch (error) {
+        throw partError(error, signal);
       }
 
       uploaded += body.length;
@@ -323,15 +365,32 @@ export class StreamClient {
   }
 
   /**
-   * Streams a payload straight into a sink, decrypting frame by frame.
-   *
-   * Nothing larger than one frame is ever resident, so this is what a
-   * multi-gigabyte download has to use — `read` below buffers the whole
-   * container and is only appropriate for payloads that fit in memory.
-   *
-   * The sink applies backpressure through its writer, so a slow disk throttles
-   * the network rather than filling the heap.
+   * Requests the container, naming only the streamed media type. An inline
+   * entry is then refused with 406 before it is burned or counted, rather than
+   * consumed by a reader that cannot decode it.
    */
+  private async fetchContainer(id: string, h: string, signal?: AbortSignal): Promise<Response> {
+    const res = await fetch(`${this.apiUrl}/vault/${id}?h=${h}`, {
+      headers: { ...this.headers(), Accept: STREAM_MEDIA_TYPE },
+      signal,
+    });
+    if (!res.ok) {
+      if (res.status === 400) throw new ErrorInvalidKeyAndOrPassword();
+      if (res.status === 404) throw new ErrorNotFound();
+      if (res.status === 406 && (await storedKindOf(res)) === 'inline') {
+        throw new ErrorInlinePayload();
+      }
+      throw new ErrorUnexpectedStatus(res.status);
+    }
+    if (res.headers.get('content-type')?.includes('application/json')) {
+      // Unreachable against a server that negotiates; kept so a misbehaving
+      // one fails loudly instead of being parsed as a container.
+      await res.body?.cancel().catch(() => undefined);
+      throw new ErrorInlinePayload();
+    }
+    return res;
+  }
+
   /** The shared key is version-prefixed when a password is required. */
   private async credentials(key: string, password: string | undefined) {
     const hasVersionPrefix = key.startsWith(KEY_VERSION_2_PREFIX);
@@ -344,6 +403,16 @@ export class StreamClient {
     };
   }
 
+  /**
+   * Streams a payload straight into a sink, decrypting frame by frame.
+   *
+   * Nothing larger than one frame is ever resident, so this is what a
+   * multi-gigabyte download has to use — `read` below buffers the whole
+   * container and is only appropriate for payloads that fit in memory.
+   *
+   * The sink applies backpressure through its writer, so a slow disk throttles
+   * the network rather than filling the heap.
+   */
   async readToSink(
     id: string,
     key: string,
@@ -362,20 +431,9 @@ export class StreamClient {
   ): Promise<{ metadata: StreamMetadata; burned: boolean }> {
     const { rawKey, h } = await this.credentials(key, password);
 
-    const res = await fetch(`${this.apiUrl}/vault/${id}?h=${h}`, {
-      headers: this.headers(),
-      signal: options.signal,
-    });
-    if (!res.ok) {
-      if (res.status === 400) throw new ErrorInvalidKeyAndOrPassword();
-      if (res.status === 404) throw new ErrorNotFound();
-      throw new ErrorUnexpectedStatus(res.status);
-    }
+    const res = await this.fetchContainer(id, h, options.signal);
     if (!res.body) {
       throw new Error('response carried no body');
-    }
-    if (res.headers.get('content-type')?.includes('application/json')) {
-      throw new Error('this secret is stored inline; use read() instead');
     }
 
     const burned = res.headers.get('x-crypt-burned') === 'true';
@@ -445,16 +503,7 @@ export class StreamClient {
   ): Promise<{ content: Uint8Array; metadata: StreamMetadata; burned: boolean }> {
     const { rawKey, h } = await this.credentials(key, password);
 
-    const res = await fetch(`${this.apiUrl}/vault/${id}?h=${h}`, {
-      headers: this.headers(),
-      signal: options.signal,
-    });
-    if (!res.ok) {
-      if (res.status === 400) throw new ErrorInvalidKeyAndOrPassword();
-      if (res.status === 404) throw new ErrorNotFound();
-      throw new ErrorUnexpectedStatus(res.status);
-    }
-
+    const res = await this.fetchContainer(id, h, options.signal);
     const container = new Uint8Array(await res.arrayBuffer());
     const burned = res.headers.get('x-crypt-burned') === 'true';
 
@@ -484,6 +533,23 @@ export class StreamClient {
     return { content, metadata: decryptor.metadata, burned };
   }
 }
+
+/**
+ * Turns a failed part upload into the error a caller can act on. The retry
+ * wrapper reports every attempt; the last one is what decided the outcome.
+ */
+const partError = (error: unknown, signal: AbortSignal | undefined): unknown => {
+  if (signal?.aborted) {
+    return signal.reason ?? error;
+  }
+  const last = error instanceof FetchRetryError ? error.errors[error.errors.length - 1] : error;
+  if (last instanceof HTTPError) {
+    return last.status === 413
+      ? new ErrorPayloadTooLarge()
+      : new ErrorUnexpectedStatus(last.status);
+  }
+  return last;
+};
 
 const concat = (chunks: Uint8Array[]): Uint8Array => {
   const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);

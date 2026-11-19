@@ -1,6 +1,8 @@
 import { Buffer } from './buffer';
 import {
   serverConfigResponseSchema,
+  payloadNotAcceptableResponseSchema,
+  INLINE_MEDIA_TYPE,
   type ServerConfigResponse,
   CreateVaultRequest,
   CreateVaultResponse,
@@ -16,7 +18,7 @@ import {
   isStreamAlgorithm,
 } from './encryption/registry';
 import { chooseCompressionAlgorithm } from './encryption/compression';
-import { ProcessingMetadata } from './vault';
+import type { PayloadKind, ProcessingMetadata } from './vault';
 import { gcm } from './encryption';
 import { inflate } from 'pako';
 
@@ -216,19 +218,26 @@ export class Client {
     const { scheme, rawKey } = parseKey(key);
     const h = await deriveVerificationHash(scheme, rawKey, password);
     const res = await fetch(`${this.apiUrl}/vault/${id}?h=${h}`, {
-      headers: this.getHeaders(),
+      // Naming only JSON is what keeps a streamed entry from being consumed by
+      // a reader that cannot decode it: the server answers 406 instead, before
+      // the burn or read count is touched.
+      headers: { ...this.getHeaders(), Accept: INLINE_MEDIA_TYPE },
     });
     if (!res.ok) {
       if (res.status === 400) {
         throw new ErrorInvalidKeyAndOrPassword();
       } else if (res.status === 404) {
         throw new ErrorNotFound();
+      } else if (res.status === 406 && (await storedKindOf(res)) === 'stream') {
+        throw new ErrorStreamedPayload();
       }
       throw new ErrorUnexpectedStatus(res.status);
     }
 
     const data = await (res.json() as Promise<ReadVaultResponse>);
     if (typeof data.c !== 'string') {
+      // Unreachable against a server that negotiates; kept so a misbehaving
+      // one fails loudly rather than decrypting `undefined`.
       throw new ErrorStreamedPayload();
     }
     let decrypted: string;
@@ -292,6 +301,18 @@ export class Client {
 }
 
 /**
+ * Reads the stored kind from a 406. Anything unparseable yields `undefined`, so
+ * callers fall back to a plain unexpected-status error.
+ */
+export async function storedKindOf(res: Response): Promise<PayloadKind | undefined> {
+  try {
+    return payloadNotAcceptableResponseSchema.parse(await res.json()).stored;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Streamed payloads are framed and byte-oriented; they never travel through the
  * inline string pipeline. Anything reaching these helpers with the streaming
  * algorithm is a routing bug, so fail loudly rather than index a missing entry.
@@ -313,10 +334,40 @@ export class ErrorPayloadTooLarge extends Error {
   }
 }
 
+/**
+ * The entry is a streamed payload and this reader only decodes inline ones.
+ * The server refused the read before burning it, so the secret is intact.
+ */
 export class ErrorStreamedPayload extends Error {
   constructor() {
     super('secret is stored as a streamed payload and must be read with the streaming reader');
     this.name = 'ErrorStreamedPayload';
+  }
+}
+
+/**
+ * The entry is stored inline and this reader only decodes streamed payloads.
+ * As above, nothing was burned.
+ */
+export class ErrorInlinePayload extends Error {
+  constructor() {
+    super('secret is stored inline and must be read with the inline reader');
+    this.name = 'ErrorInlinePayload';
+  }
+}
+
+/**
+ * Raised by a {@link Vault} when the key is correct but the entry is of a kind
+ * the reader did not accept. Thrown before any state changes, so the entry is
+ * neither burned nor counted. Servers answer it with 406.
+ */
+export class ErrorPayloadNotAcceptable extends Error {
+  readonly stored: PayloadKind;
+
+  constructor(stored: PayloadKind) {
+    super(`secret is stored ${stored === 'stream' ? 'as a stream' : 'inline'}`);
+    this.name = 'ErrorPayloadNotAcceptable';
+    this.stored = stored;
   }
 }
 

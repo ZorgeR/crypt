@@ -2,6 +2,9 @@ import { Buffer } from '../buffer';
 import {
   CEK_LENGTH,
   DEFAULT_FRAME_SIZE_LOG2,
+  HEADER_FIXED_LENGTH,
+  MAX_META_LENGTH,
+  MAX_WRAPPED_KEY_LENGTH,
   NONCE_PREFIX_LENGTH,
   STREAM_VERSION,
   TAG_LENGTH,
@@ -337,5 +340,49 @@ describe('stream container / input validation', () => {
       frameSizeLog2: LOG2,
     });
     await expect(encryptor.encryptFrame(2, bytes(F))).rejects.toThrow();
+  });
+});
+
+describe('stream container / header bounds', () => {
+  // Both lengths are read before anything is authenticated, so they must be
+  // bounded before a streaming reader sizes a buffer from them.
+  const WK_LEN_OFFSET = 12;
+
+  it('refuses an oversized wrapped key length from the fixed head alone', async () => {
+    const head = (await seal(bytes(10))).slice(0, HEADER_FIXED_LENGTH);
+    new DataView(head.buffer).setUint32(WK_LEN_OFFSET, 0xffffffff, false);
+    expect(() => readWrappedKeyLength(head)).toThrow(/wrapped key length/);
+  });
+
+  it('refuses an oversized wrapped key length when parsing the header', async () => {
+    const container = await seal(bytes(10));
+    new DataView(container.buffer).setUint32(WK_LEN_OFFSET, MAX_WRAPPED_KEY_LENGTH + 1, false);
+    expect(() => parseStreamHeader(container)).toThrow(/wrapped key length/);
+  });
+
+  it('refuses an oversized metadata frame length', async () => {
+    const container = await seal(bytes(10));
+    const wkLen = readWrappedKeyLength(container);
+    new DataView(container.buffer).setUint32(16 + wkLen, MAX_META_LENGTH + 1, false);
+    expect(() => parseStreamHeader(container)).toThrow(/metadata frame length/);
+  });
+
+  it('checks the magic before trusting the length field', () => {
+    const head = new Uint8Array(HEADER_FIXED_LENGTH);
+    head.set(new TextEncoder().encode('{"c"'), 0);
+    expect(() => readWrappedKeyLength(head)).toThrow(/not a CFYI container/);
+  });
+
+  it('will not seal metadata that a reader would refuse', async () => {
+    await expect(
+      createStreamEncryptor({
+        key: KEY,
+        plaintextLength: 0,
+        metadata: { name: 'x'.repeat(MAX_META_LENGTH), type: '', size: 0 },
+        frameSizeLog2: LOG2,
+      }),
+    ).rejects.toMatchObject({
+      error: expect.objectContaining({ message: expect.stringMatching(/filename is too long/) }),
+    });
   });
 });

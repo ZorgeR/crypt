@@ -231,6 +231,14 @@ Abstract
    
    Retrieves vault content using vault ID and key hash.
 
+   Entries are stored either inline (JSON) or as a streamed container in
+   object storage (see docs/streaming-format.md). Readers MUST name the
+   kinds they can decode in `Accept`. A streamed entry is sent only when
+   `Accept` names `application/octet-stream` explicitly; wildcards do not
+   count. When the hash is correct but the stored kind was not accepted,
+   the server MUST answer `406` with `{"stored": "inline" | "stream"}`
+   without burning the entry or counting the read.
+
 ### 5.3. Check Vault Existence
 
    ```http
@@ -368,6 +376,9 @@ Abstract
    - `201`: Vault entry created successfully  
    - `400`: Invalid key/password hash or malformed request
    - `404`: Vault entry not found or already burned
+   - `406`: Key accepted, but the entry is stored in a form the reader did
+     not accept (nothing burned or counted)
+   - `413`: Payload or declared upload size exceeds the server maximum
    - `429`: Rate limit exceeded
    - `500`: Internal server error
 

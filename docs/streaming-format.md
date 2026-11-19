@@ -146,6 +146,15 @@ headerTotal = 28 + wkLen + metaLen
 Tampering with any of them MUST cause authentication failure on the first frame
 decrypted.
 
+`wkLen` and `metaLen` are acted on before anything is authenticated: a
+streaming reader has to buffer that many bytes to reach the metadata frame. A
+reader MUST therefore reject `wkLen > 16384` and `metaLen > 65536` before
+buffering, and MUST check `magic` and `version` before trusting `wkLen`. An
+encryptor MUST NOT produce a container outside these bounds. Real values are far
+below them (§3.2: a wrapped key is at most ~3.7 KB; the metadata frame is a
+small JSON object plus a tag), so the bounds only stop a corrupt or hostile
+response from sizing a multi-gigabyte allocation.
+
 ### 4.2. Metadata frame
 
 Frame counter `0`, containing AES-256-GCM over the UTF-8 JSON:
@@ -188,6 +197,7 @@ offset(i) = headerTotal + (i - 1) × (F + 16)
 A decryptor MUST:
 
 - reject a container whose `magic` or `version` does not match;
+- reject `wkLen` or `metaLen` above the bounds in §4.1, before buffering them;
 - reject a frame whose GCM tag does not verify;
 - reject a stream whose final decrypted frame does not carry `final = 0x01`;
 - reject a stream whose decrypted plaintext length does not equal
@@ -300,6 +310,17 @@ The server MUST stream each part to storage without buffering. Chunk uploads
 MUST use a rate-limit bucket separate from the vault API, and MUST be subject to
 a per-client total-bytes quota.
 
+A declared `size` above the deployment maximum MUST be refused with `413`, so
+clients can report the payload as too large rather than as a generic error.
+
+Re-sending a part number MUST replace the earlier attempt, sized against every
+other part, rather than being rejected. Because a part is a whole number of
+frames sealed under the CEK with counter nonces, a re-sent part is
+byte-identical to the original, so a retry is safe even when the first attempt
+was stored and only its response was lost. Clients SHOULD retry a part on a
+network failure, `408`, `429`, or `5xx` with exponential backoff, and MUST NOT
+retry other `4xx` answers.
+
 Presigned URLs MUST NOT be issued to clients: the storage endpoint is never
 exposed.
 
@@ -308,6 +329,29 @@ exposed.
 `GET /vault/{id}?h={hash}` retains its current URL and semantics. When the
 record carries `blob`, the server streams the object body as the response after
 the hash check passes.
+
+Readers declare what they can decode in `Accept`:
+
+| Reader | `Accept` | Inline entry | Streamed entry |
+| --- | --- | --- | --- |
+| Inline (CLI, extension, inline web view) | `application/json`, a wildcard, or none | JSON | `406` |
+| Streaming | `application/octet-stream` | `406` | container bytes |
+
+A streamed entry MUST only be sent to a reader whose `Accept` names
+`application/octet-stream` explicitly. Wildcards MUST NOT count: every client
+built before this path sends `*/*` or nothing, and handing it a container would
+burn a secret it cannot decode.
+
+When the hash is correct but the entry is of a kind the reader did not accept,
+the server MUST answer `406` with `{ "stored": "inline" | "stream" }` and MUST
+NOT burn the entry, decrement its read count, or send a read webhook. The kind
+check MUST run after the hash check and inside the same atomic script, so a
+caller without the key learns nothing about how the entry is stored, and the
+check cannot race a concurrent burn. Responses carry `Vary: Accept`.
+
+Clients use the `406` to switch readers. A share link's `s=true` flag is
+therefore only a hint for which view to try first; a missing or wrong flag
+costs one round trip, never the secret.
 
 The route MUST be excluded from response compression — the payload is ciphertext
 and incompressible. The server SHOULD honour `Range` to allow resumption.

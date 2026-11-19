@@ -3,6 +3,8 @@ import { Redis } from 'ioredis';
 import type { TokenGenerator } from './tokens.js';
 import {
   ErrorInvalidKeyAndOrPassword,
+  ErrorPayloadNotAcceptable,
+  type PayloadKind,
   type Vault,
   type VaultValue,
   vaultValueSchema,
@@ -78,7 +80,7 @@ export const createRedisVault = (
 
       return { id, dt };
     },
-    async get(id, h, ip) {
+    async get(id, h, ip, accepts) {
       const key = getKey(id);
 
       // TODO: try to not pull the full redis entry into memory until the ip address is confirmed to be allowed
@@ -133,6 +135,17 @@ export const createRedisVault = (
     return cjson.encode({ status = "invalid_hash" })
   end
 
+  -- The key is right, so the reader may learn how the entry is stored. If it
+  -- cannot decode that kind, stop here: nothing has been burned or counted yet,
+  -- and consuming the entry would destroy a secret the reader cannot open.
+  local kind = "inline"
+  if type(data.blob) == "table" then
+    kind = "stream"
+  end
+  if (kind == "stream" and ARGV[2] ~= "1") or (kind == "inline" and ARGV[3] ~= "1") then
+    return cjson.encode({ status = "not_acceptable", stored = kind })
+  end
+
   local burned = false
   local reason = nil
   -- Handle read count logic
@@ -171,16 +184,23 @@ export const createRedisVault = (
         1,
         key,
         h,
+        accepts.stream ? '1' : '0',
+        accepts.inline ? '1' : '0',
       )) as string | null;
       if (!outcome) {
         return undefined;
       }
 
       const redisOutcome = JSON.parse(outcome) as {
-        status: 'invalid_hash' | 'success';
+        status: 'invalid_hash' | 'success' | 'not_acceptable';
         burned?: boolean;
         reason?: 'read_count_zero' | 'burned' | 'ttl_expired' | 'failed_attempts';
+        stored?: PayloadKind;
       };
+      if (redisOutcome.status === 'not_acceptable') {
+        // No READ webhook: nothing was read.
+        throw new ErrorPayloadNotAcceptable(redisOutcome.stored ?? (blob ? 'stream' : 'inline'));
+      }
       if (redisOutcome.status === 'invalid_hash') {
         const ts = Date.now();
         if (wh?.fpk) {
